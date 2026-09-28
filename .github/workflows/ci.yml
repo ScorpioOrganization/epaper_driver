@@ -1,0 +1,154 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build_and_test:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Jetson JetPack 6 userland (Ubuntu 22.04, gcc 11).
+          - name: jammy-gcc
+            runner: ubuntu-24.04
+            image: ubuntu:22.04
+            compiler: gcc
+            gtest: system
+          - name: jammy-gcc-arm64
+            runner: ubuntu-24.04-arm
+            image: ubuntu:22.04
+            compiler: gcc
+            gtest: system
+          - name: noble-gcc
+            runner: ubuntu-24.04
+            image: ubuntu:24.04
+            compiler: gcc
+            gtest: system
+            install_check: true
+          # No libgtest-dev, so this leg goes through the FetchContent fallback in CMakeLists.txt.
+          - name: noble-clang
+            runner: ubuntu-24.04
+            image: ubuntu:24.04
+            compiler: clang
+            gtest: fetched
+          - name: noble-gcc-asan-ubsan
+            runner: ubuntu-24.04
+            image: ubuntu:24.04
+            compiler: gcc
+            gtest: system
+            cxx_flags: -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
+    runs-on: ${{ matrix.runner }}
+    # A bare distro image instead of the runner's own, which ships hundreds of preinstalled
+    # packages. Anything not installed below (compiler, CMake, GoogleTest, kernel headers) breaks
+    # the build, which keeps the "no third party dependencies" promise honest.
+    container: ${{ matrix.image }}
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      COMPILER: ${{ matrix.compiler }}
+      GTEST: ${{ matrix.gtest }}
+      CXX_FLAGS: ${{ matrix.cxx_flags }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # git has to be there before actions/checkout, otherwise it silently downloads a tarball.
+      - name: Install dependencies
+        run: |
+          PKGS=(git ca-certificates cmake ninja-build)
+          if [ "${COMPILER}" = clang ]; then
+            PKGS+=(clang)
+          else
+            PKGS+=(g++)
+          fi
+          if [ "${GTEST}" = system ]; then
+            PKGS+=(libgtest-dev)
+          fi
+          apt-get update
+          apt-get install -y --no-install-recommends "${PKGS[@]}"
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          if [ "${COMPILER}" = clang ]; then
+            export CC=clang CXX=clang++
+          else
+            export CC=gcc CXX=g++
+          fi
+          "${CXX}" --version
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="${CXX_FLAGS}"
+
+          # CMakeLists.txt quietly falls back to downloading GoogleTest when the system one is
+          # missing, so make sure each leg really tests the path it is named after.
+          if [ "${GTEST}" = fetched ] && [ ! -d build/_deps/googletest-src ]; then
+            echo "::error::expected the FetchContent GoogleTest, found a system one"
+            exit 1
+          fi
+          if [ "${GTEST}" = system ] && [ -d build/_deps/googletest-src ]; then
+            echo "::error::expected the system GoogleTest, fell back to FetchContent"
+            exit 1
+          fi
+
+      - name: Build
+        run: |
+          cmake --build build
+
+      - name: Run tests
+        run: |
+          ctest --test-dir build --output-on-failure
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.name }}
+          path: build/test_results/
+          retention-days: 14
+
+      # Builds a tiny project against the installed package, so the export set and
+      # epaper_driverConfig.cmake keep working for find_package() users.
+      - name: Check install
+        if: matrix.install_check
+        run: |
+          PREFIX="${RUNNER_TEMP}/prefix"
+          CONSUMER="${RUNNER_TEMP}/consumer"
+          cmake --install build --prefix "${PREFIX}"
+
+          mkdir -p "${CONSUMER}"
+          cat > "${CONSUMER}/CMakeLists.txt" <<'EOF'
+          cmake_minimum_required(VERSION 3.16)
+          project(consumer LANGUAGES CXX)
+          find_package(epaper_driver 0.1 REQUIRED)
+          add_executable(consumer main.cpp)
+          target_link_libraries(consumer PRIVATE epaper_driver::epaper_driver)
+          EOF
+          cat > "${CONSUMER}/main.cpp" <<'EOF'
+          #include "epaper/epaper.hpp"
+
+          int main() {
+            const epaper::Framebuffer framebuffer(128, 296);
+            return framebuffer.width() == 128 ? 0 : 1;
+          }
+          EOF
+
+          cmake -S "${CONSUMER}" -B "${CONSUMER}/build" -G Ninja -DCMAKE_PREFIX_PATH="${PREFIX}"
+          cmake --build "${CONSUMER}/build"
+          "${CONSUMER}/build/consumer"

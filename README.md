@@ -1,5 +1,8 @@
 # epaper_driver
 
+[![CI](https://github.com/ScorpioOrganization/epaper_driver/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/ScorpioOrganization/epaper_driver/actions/workflows/ci.yml)
+[![Coverage](https://github.com/ScorpioOrganization/epaper_driver/actions/workflows/coverage.yml/badge.svg?branch=master)](https://scorpioorganization.github.io/epaper_driver/)
+
 Pure C++17 driver for small SPI e-paper panels on Linux single board computers (NVIDIA Jetson, Raspberry
 Pi). No third party dependencies: just the standard library and the Linux kernel
 headers (spidev + GPIO character device v2, kernel 5.10 or newer).
@@ -149,6 +152,28 @@ target_link_libraries(my_app PRIVATE epaper_driver::epaper_driver)
   streams against Waveshare's reference driver; the Linux backends run against a fake kernel.
 - `PbmFilePanel` stands in for the real panel: every refresh writes a PBM image (view it with any image
   viewer, or convert with `pnmtopng`).
+
+## CI
+
+GitHub Actions, on every push to `master` and every PR against it:
+
+- `ci.yml` builds with `-Werror` and runs the unit tests in bare `ubuntu:22.04` / `ubuntu:24.04` containers
+  (so a missing dependency cannot hide behind the runner image): gcc 11 on x86_64 and arm64 (the Jetson
+  toolchain), gcc 13, clang 18 with the downloaded GoogleTest, gcc 13 with ASan + UBSan. One leg also installs
+  the library and builds a small `find_package(epaper_driver)` consumer against it.
+- `coverage.yml` builds with `--coverage`, collects line and branch coverage (fastcov, tests excluded) and
+  renders it with coverview. PRs get a comment with full and patch (changed lines only) coverage, the
+  reports are attached as workflow artifacts. The `master` report is published to
+  <https://scorpioorganization.github.io/epaper_driver/> (needs Settings > Pages > Source: GitHub Actions).
+
+To run a CI leg locally:
+
+```bash
+docker run --rm -v "$PWD":/src:ro -w /tmp ubuntu:24.04 bash -c '
+  apt-get update && apt-get install -y --no-install-recommends cmake ninja-build g++ libgtest-dev &&
+  cmake -S /src -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug && cmake --build build &&
+  ctest --test-dir build --output-on-failure'
+```
 
 ## Credits
 
